@@ -8,15 +8,15 @@ UNIT_DIR=/etc/systemd/system
 JOURNAL_CONF=/etc/systemd/journald@check-ip.conf
 TCP_TIMEOUT=3
 TCP_TRIES=3
-# 调用更换接口后最多等待新 IP 生效的秒数，以及查询间隔
+# 调用更换接口后最多等待新 IP 生效的秒数与查询间隔
 WAIT_SECONDS=180
 WAIT_STEP=5
-# 冷却状态目录：服务里由 StateDirectory= / ReadWritePaths= 放行，ProtectSystem=strict 下其它位置不可写
+# 更换计数、冷却状态与单实例锁所在目录
 STATE_DIR=/var/lib/check-ip
 # 配置行格式：KEY=VALUE，值可加双引号，行尾可加 # 注释；SKIP 为可忽略的空行与注释行
 PAIR='^([A-Z0-9_]+)="?([^"#[:space:]]*)"?[[:space:]]*(#.*)?$'
 SKIP='^[[:space:]]*(#|$)'
-# 检测目标：IPv4 为「域名或 IPv4:端口」，IPv6 为「域名或 [IPv6]:端口」；域名标签不以 - 开头或结尾，IPv4 每段 0-255，端口 1-65535
+# 检测目标：IPv4 为「域名或 IPv4:端口」，IPv6 为「域名或 [IPv6]:端口」
 OCTET='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
 LABEL='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
 PORT='([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])'
@@ -25,7 +25,7 @@ TARGET4="($DOMAIN|$OCTET(\.$OCTET){3}):$PORT"
 TARGET6="($DOMAIN|\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\]):$PORT"
 TARGETS4_RE="^$TARGET4(,$TARGET4)*$"
 TARGETS6_RE="^$TARGET6(,$TARGET6)*$"
-# 接口地址经 curl 配置的双引号传递，不允许双引号、反斜杠与 #；IPv6 的接口可留空
+# 接口地址放在 curl 配置的双引号里传递，不允许双引号、反斜杠与 #；IPv6 的接口可留空
 API_RE='^https?://[^"#\\]+$'
 API6_RE='^(https?://[^"#\\]+)?$'
 BOOL_RE='^(true|false)$'
@@ -59,8 +59,7 @@ render_config() {
     done
 }
 
-# 读取配置到 CFG_<配置项>：先取模板默认值，配置文件存在时按白名单逐行覆盖；不 source 配置文件，避免执行其中的代码
-# 无法识别的配置项记入 DROPPED
+# 读取配置到 CFG_<配置项>：先取模板默认值，再按白名单逐行覆盖（不 source，避免执行其中的代码）；无法识别的配置项记入 DROPPED
 read_config() {
     local line key default comment entry keys=, n=0
     DROPPED=''
@@ -85,8 +84,7 @@ read_config() {
     done <"$CONFIG_FILE"
 }
 
-# 按模板写入配置文件；先写临时文件再替换，避免定时任务读到写了一半的配置，内容未变化时不改动文件
-# mktemp 建的临时文件权限为 600，接口地址不会短暂暴露
+# 按模板写入配置文件：写权限 600 的临时文件再替换，避免读到写了一半的配置；内容未变化时不改动文件
 write_config() {
     local tmp
     tmp=$(mktemp "$CONFIG_FILE.XXXXXX")
@@ -120,11 +118,10 @@ ensure_deps() {
     fi
 }
 
-# 用法：ask 变量名 提示 校验正则；方括号内显示当前值，直接回车保留，输入 - 清空（只有允许留空的配置项能通过校验）
+# 用法：ask 变量名 提示 校验正则；方括号内显示当前值，直接回车保留，输入 - 清空（仅允许留空的配置项能通过校验）
 ask() {
     local var=$1 prompt=$2 re=$3 input cur=${!1}
     while true; do
-        # 输入结束（Ctrl-D）时退出，否则当前值不合法时会无限重复提示
         read -rp "$prompt${cur:+ [$cur]}：" input || die "输入已结束，配置未保存"
         # 复制粘贴常带首尾空格，这些配置值本身不含空白，统一去掉
         input=${input//[[:space:]]/}
@@ -173,6 +170,14 @@ shown_ip() {
     get_ip "$1" || echo "获取失败"
 }
 
+# 打开单实例锁的文件描述符 9：锁加在状态目录而非配置文件上（编辑器保存时可能替换文件）
+# 目录只给 root 访问，否则普通用户也能打开它一直占着锁
+open_lock() {
+    [[ -d "$STATE_DIR" ]] || mkdir -m 700 "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    exec 9<"$STATE_DIR"
+}
+
 # 交互式填写配置
 configure() {
     local ip
@@ -213,15 +218,11 @@ install_self() {
     [[ "$interactive" == false ]] || configure
     [[ "$CFG_INTERVAL_MINUTES" =~ $INTERVAL_RE ]] || die "INTERVAL_MINUTES 只能是 1-1440 的整数，请修正 $CONFIG_FILE 后重新执行 check-ip install"
     write_config
-    # 配置可能已修正，清除冷却与更换计数，使新配置立即生效；先停掉正在运行的检测，否则它会按旧配置继续更换并重新写入冷却
-    # 定时器一起停：只停检测的话，定时器可能立刻把它重新拉起来抢锁；记下原状态，后面按原状态恢复
+    # 清除冷却与更换计数使新配置立即生效。先停定时器与检测（只停检测的话定时器会立刻把它拉起），
+    # 再加锁确认没有手动运行或后台试运行；记下定时器原状态，之后按原状态恢复
     systemctl is-active --quiet check-ip.timer && timer_active=true
     systemctl stop check-ip.timer check-ip.service 2>/dev/null || true
-    # 手动运行或上次的试运行（SSH 断开后仍在后台）不受 systemctl 管理，加锁确认没有它们再清除
-    # 目录只给 root 访问，否则普通用户也能打开它并一直占着锁，让检测永远跳过
-    [[ -d "$STATE_DIR" ]] || mkdir -m 700 "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
-    exec 9<"$STATE_DIR"
+    open_lock
     if ! flock -n 9; then
         [[ "$timer_active" == false ]] || systemctl start check-ip.timer
         die "另一个 check-ip 正在运行（可能是上次的试运行），配置已保存；请等它结束后重新执行 check-ip install"
@@ -253,11 +254,11 @@ PrivateTmp=true
 NoNewPrivileges=true
 StateDirectory=check-ip
 StateDirectoryMode=0700
-# 低于 235 的 systemd 不支持 StateDirectory=，状态目录由 install 预先创建并在这里放行写入
+# systemd 低于 235 不支持 StateDirectory=，由这里放行 install 预先创建的状态目录
 ReadWritePaths=-$STATE_DIR
-# 等待新 IP 生效时一次运行会持续数分钟，显式关闭启动超时
+# 等待新 IP 生效时一次运行会持续数分钟
 TimeoutStartSec=infinity
-# 标记由定时任务启动，遇到手动运行或试运行时直接跳过
+# 标记由定时任务启动：遇到手动运行或试运行时直接跳过
 Environment=CHECK_IP_TIMER=1
 # 脚本输出记为 notice，并丢弃 systemd 每次启停写的 info 记录；运行失败的 warning 仍保留
 SyslogLevel=notice
@@ -269,8 +270,7 @@ EOF
 Description=Run VPS IP block check every $CFG_INTERVAL_MINUTES minute(s)
 
 [Timer]
-# 不用 OnBootSec：开机时间已过时启动定时器会立即触发，首次安装试运行后会紧接着再检测一轮
-# 重装时若距上次运行已超过间隔，OnUnitActiveSec 仍会立即触发一次，由单实例锁避免与试运行同时更换
+# 不用 OnBootSec：开机时间已过时启动定时器会立即触发，与试运行重复
 OnActiveSec=${CFG_INTERVAL_MINUTES}min
 OnUnitActiveSec=${CFG_INTERVAL_MINUTES}min
 AccuracySec=1s
@@ -282,17 +282,16 @@ EOF
     # 日志实例已在运行时重启它，使新的大小限制生效
     [[ -z "$namespace" ]] || systemctl try-restart systemd-journald@check-ip.service
     if [[ "$interactive" == false ]]; then
-        # 定时任务原来在运行时重新启动它，使新的执行间隔生效
         [[ "$timer_active" == false ]] || systemctl restart check-ip.timer
         echo "已按现有配置安装。在终端中执行 check-ip install 可按提示修改配置并启用定时任务"
         return 0
     fi
-    # 先启用定时任务再试运行：试运行若换了 IP，SSH 会断开，install 可能来不及执行后面的命令
+    # 先启用定时任务再试运行：试运行换了 IP 会断开 SSH，install 可能来不及执行后面的命令
     systemctl enable --quiet check-ip.timer
     systemctl restart check-ip.timer
     echo "定时任务已启用：每 $CFG_INTERVAL_MINUTES 分钟自动执行一次。查看日志：$log_cmd"
     echo "正在试运行……"
-    # 忽略 SSH 断开时的挂断信号，让试运行跑完；试运行失败只表示当前网络有问题
+    # 忽略 SSH 断开时的挂断信号，让试运行跑完
     trap '' HUP
     "$BIN" || echo "试运行未全部通过（原因见上方），定时任务会按间隔继续检测"
 }
@@ -315,28 +314,23 @@ load_config() {
 }
 
 # 用法：is_reachable 4|6；任一目标的 TCP 端口可连接返回 0，全部不通返回 1，全部解析不到对应地址返回 2
-# 逐项结果只在终端手动运行时显示
 is_reachable() {
-    local fam=$1 target host port ip try resolved=0 targets=()
-    if [[ "$fam" == 4 ]]; then
-        IFS=, read -ra targets <<<"$CFG_CHECK_TARGETS"
-    else
-        IFS=, read -ra targets <<<"$CFG_CHECK_TARGETS_V6"
-    fi
+    local fam=$1 list=CFG_CHECK_TARGETS target host port ip try resolved=0 targets=()
+    [[ "$fam" == 4 ]] || list+=_V6
+    IFS=, read -ra targets <<<"${!list}"
     for target in "${targets[@]}"; do
         host=${target%:*} port=${target##*:}
         host=${host#\[} host=${host%\]}
-        # 先解析出对应协议的地址再检测，避免连接走另一个协议；ahostsv6 带 AI_V4MAPPED，要排除 ::ffff: 开头的 IPv4 映射地址
+        # 只取对应协议的地址，ahostsv6 返回的 ::ffff: IPv4 映射地址要排除；解析不到是本机 DNS 的问题，不当作被墙
         ip=$(getent "ahostsv$fam" "$host" | awk '$1 !~ /^::ffff:/ {print $1; exit}') || true
-        # 域名解析失败是本机 DNS 的问题，不能当作被墙
         if [[ -z "$ip" ]]; then
             [[ ! -t 2 ]] || log "IPv$fam ${host}：解析不到 IPv$fam 地址，跳过"
             continue
         fi
         resolved=1
-        # 以 TCP 连接为准：ICMP 放行而 TCP 被阻断时 ping 仍能通，不能用来判断；多试几次，避免偶发丢包误判
+        # 以 TCP 为准（被墙时可能 ICMP 放行而 TCP 全断），多试几次避免偶发丢包误判
+        # --foreground 让终端里的 Ctrl-C 能中止探测，否则 timeout 自成进程组收不到中断
         for ((try = 1; try <= TCP_TRIES; try++)); do
-            # --foreground：在终端运行时按 Ctrl-C 能中止，否则 timeout 自成进程组收不到中断，脚本会继续去换 IP
             if timeout --foreground "$TCP_TIMEOUT" bash -c "</dev/tcp/$ip/$port" 2>/dev/null; then
                 [[ ! -t 2 ]] || log "IPv$fam ${host}：TCP $port 端口可连接，网络正常"
                 return 0
@@ -349,11 +343,9 @@ is_reachable() {
 }
 
 # 用法：change_ip 接口地址；返回 curl 的退出码
+# 接口地址经标准输入交给 curl，不出现在进程参数和日志里；-q 不读 ~/.curlrc，-g 不展开地址里的 {} []，-L 跟随跳转
 change_ip() {
     local resp rc=0
-    # 接口地址经标准输入交给 curl，不出现在进程参数和日志里（地址中可能带密钥）
-    # -q 不读 ~/.curlrc，-g 不展开地址里的 {} []（否则一次调用会变成多次请求）；跟随跳转（如 http 跳到 https）
-    # 连不上或返回 HTTP 错误时 curl 失败，记录其错误信息
     resp=$(printf 'url = "%s"\n' "$1" | curl -q -g -sSfL --connect-timeout 10 --max-time 15 -K - 2>&1) || rc=$?
     if ((rc == 0)); then
         log "已调用更换 IP 接口，返回：$resp"
@@ -363,16 +355,12 @@ change_ip() {
     return "$rc"
 }
 
-# 用法：wait_ip_change 4|6 旧IP；本机公网 IP 变得与旧 IP 不同时输出新 IP 并返回 0，超过 WAIT_SECONDS 返回 1
-# 服务商换 IP 常要几十秒，固定等几秒就重新检测会在旧 IP 上误判，接着又换
+# 用法：wait_ip_change 4|6 旧IP；本机公网 IP 与旧 IP 不同时输出新 IP 并返回 0，超过 WAIT_SECONDS 返回 1
 wait_ip_change() {
     local end=$((SECONDS + WAIT_SECONDS)) ip
     while ((SECONDS < end)); do
         sleep "$WAIT_STEP"
-        if ip=$(get_ip "$1") && [[ "$ip" != "$2" ]]; then
-            echo "$ip"
-            return 0
-        fi
+        ip=$(get_ip "$1") && [[ "$ip" != "$2" ]] && { echo "$ip"; return 0; }
     done
     return 1
 }
@@ -382,16 +370,12 @@ cooldown_left() {
     local end_at now
     end_at=$(cat "$STATE_DIR/cooldown-ipv$1" 2>/dev/null) || return 1
     now=$(date +%s)
-    if [[ "$end_at" =~ ^[0-9]+$ ]] && ((end_at > now)); then
-        echo $(((end_at - now + 59) / 60))
-        return 0
-    fi
-    return 1
+    [[ "$end_at" =~ ^[0-9]+$ ]] && ((end_at > now)) || return 1
+    echo $(((end_at - now + 59) / 60))
 }
 
-# 用法：stop_changing 4|6 原因；记录原因并结束本轮更换，冷却时长大于 0 时开始冷却，冷却期内只检测、不更换
+# 用法：stop_changing 4|6 原因；记录原因并结束本轮更换：清除计数（否则不冷却时下次一开始就已达上限），冷却时长大于 0 时开始冷却
 stop_changing() {
-    # 本轮已结束，清除更换计数；否则不冷却时下次运行一开始就已达上限，再也不会更换
     rm -f "$STATE_DIR/attempts-ipv$1"
     if ((CFG_COOLDOWN_MINUTES == 0)); then
         log "IPv$1：$2"
@@ -406,21 +390,21 @@ stop_changing() {
 check_family() {
     local fam=$1 retry st rc left cur old new api=$CFG_CHANGE_IP_API attempts=$STATE_DIR/attempts-ipv$1
     [[ "$fam" == 4 ]] || api=$CFG_CHANGE_IPV6_API
-    # 连境外查询源都访问不到时，说明本机没有该协议的外网连接，不能当作被墙
+    # 连境外查询源都访问不到，说明本机没有该协议的外网连接，不能当作被墙
     cur=$(get_ip "$fam") || { log "IPv$fam：获取本机公网 IPv$fam 失败，本次跳过检测"; return 1; }
-    # 更换次数存在状态文件里：换 IP 让服务器重启或运行被中断时，下次运行接着计数，不会从 0 开始无限更换
+    # 更换次数跨运行延续：换 IP 导致重启或运行被中断时不会从 0 开始无限更换
     retry=$(cat "$attempts" 2>/dev/null) || retry=0
     [[ "$retry" =~ ^[0-9]+$ ]] || retry=0
     # 每次更换后都重新检测，最后一次换出的 IP 也会被验证
     while true; do
         if is_reachable "$fam"; then break; else st=$?; fi
         ((st == 1)) || { log "IPv$fam：所有检测目标都解析不到 IPv$fam 地址，无法判断是否被墙，本次不更换 IP"; return 1; }
-        # 冷却期内不更换；进入冷却时已记录原因，这里只在终端显示，避免每次运行都写日志
+        # 冷却期内不更换；原因在进入冷却时已记录，这里只在终端显示
         if left=$(cooldown_left "$fam"); then
             [[ ! -t 2 ]] || log "IPv$fam：所有检测目标均不通，冷却中，${left} 分钟内不更换 IP"
             return 0
         fi
-        # 只有 IPv6 的接口允许留空：不借用 IPv4 接口，避免 IPv6 被墙时把 IPv4 无故换掉
+        # 只有 IPv6 的接口允许留空：不借用 IPv4 接口，避免把 IPv4 无故换掉
         if [[ -z "$api" ]]; then
             stop_changing "$fam" "当前 IP $(shown_ip "$fam")：所有检测目标均不通，未填写 CHANGE_IPV6_API，无法更换"
             return 1
@@ -437,20 +421,16 @@ check_family() {
         if change_ip "$api"; then rc=0; else rc=$?; fi
         case "$rc" in
             0)
-                if new=$(wait_ip_change "$fam" "$old"); then
-                    cur=$new
-                else
-                    stop_changing "$fam" "调用更换接口后 ${WAIT_SECONDS} 秒内 IP 仍未变化"
-                    return 1
-                fi
+                new=$(wait_ip_change "$fam" "$old") || { stop_changing "$fam" "调用更换接口后 ${WAIT_SECONDS} 秒内 IP 仍未变化"; return 1; }
+                cur=$new
                 ;;
             16 | 18 | 28 | 52 | 56 | 92)
-                # HTTP/2 出错、传输不完整、超时、空响应或接收中断：请求可能已送达，服务商可能正在更换，等 IP 变化后再判断，避免接连再换
-                # curl 对连接超时和响应超时都返回 28，无法区分，连接超时也会等待
+                # HTTP/2 出错、传输不完整、超时（含连接超时，curl 无法区分）、空响应或接收中断：
+                # 请求可能已送达，等 IP 变化后再判断，避免接连再换
                 log "IPv$fam：请求可能已送达，等待 IP 变化"
                 if new=$(wait_ip_change "$fam" "$old"); then cur=$new; fi
                 ;;
-            # 其它失败（连接被拒绝、解析失败、返回 HTTP 错误等）IP 不会变化，不必等待，直接计入次数
+            # 其它失败（连接被拒绝、解析失败、返回 HTTP 错误等）IP 不会变化，直接计入次数
         esac
     done
     rm -f "$STATE_DIR/cooldown-ipv$fam" "$attempts"
@@ -466,13 +446,9 @@ main() {
     esac
     command -v curl >/dev/null && command -v flock >/dev/null && command -v timeout >/dev/null && command -v getent >/dev/null || die "缺少依赖：需要 curl、flock、timeout 与 getent"
     [[ -f "$CONFIG_FILE" && -r "$CONFIG_FILE" ]] || die "无法读取 ${CONFIG_FILE}：请以 root 运行，尚未安装时先执行 install"
-    # 以状态目录加锁：同时只运行一个实例，避免手动运行与定时任务同时更换 IP
-    # 不锁配置文件：编辑器保存时可能替换文件，新旧实例会各锁一个文件而同时运行；目录只给 root 访问，见 install_self
-    [[ -d "$STATE_DIR" ]] || mkdir -m 700 "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
-    exec 9<"$STATE_DIR"
+    open_lock
     if [[ -n "${CHECK_IP_TIMER:-}" ]]; then
-        # 定时任务遇到手动运行或试运行时直接跳过，不排队等锁，避免反复超时报错
+        # 定时任务遇到手动运行或试运行时直接跳过，不排队等锁
         flock -n 9 || exit 0
     else
         flock -w 300 9 || die "等待另一个 check-ip 结束超过 300 秒，本次退出"

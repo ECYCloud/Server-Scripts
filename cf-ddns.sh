@@ -38,33 +38,12 @@ render_config() {
     done
 }
 
-# 输出旧版 CF_RECORD_NAME 并入 CF_RECORDS 时的代理状态：记录已存在时沿用 Cloudflare 上的当前设置，不存在时沿用 CF_PROXIED
-legacy_proxied() {
-    local resp current=''
-    # 令牌、区域 ID 或域名无效时旧版本身无法运行，不查询，直接沿用 CF_PROXIED
-    if [[ "$CFG_CF_API_TOKEN" =~ $TOKEN_RE && "$CFG_CF_ZONE_ID" =~ $ZONE_RE && "$1" =~ $DOMAIN_RE ]]; then
-        command -v curl >/dev/null && command -v jq >/dev/null || return 1
-        CF_API_TOKEN=$CFG_CF_API_TOKEN
-        API="https://api.cloudflare.com/client/v4/zones/${CFG_CF_ZONE_ID}/dns_records"
-        resp=$(cf_api GET "?name.exact=$1") || return 1
-        current=$(jq -r '[.result[] | select(.type == "A" or .type == "AAAA") | .proxied] | if length > 0 then .[0] else empty end' <<<"$resp")
-    fi
-    if [[ -n "$current" ]]; then
-        echo "$current"
-    elif [[ "$CFG_CF_PROXIED" == true ]]; then
-        echo true
-    else
-        echo false
-    fi
-}
-
-# 读取已有配置的值到 CFG_<配置项>，旧版 CF_RECORD_NAME / CF_PROXIED 并入 CF_RECORDS
+# 读取已有配置的值到 CFG_<配置项>
 read_config() {
-    local line key entry name proxied keys=, dropped='' n=0
+    local line key entry keys=, dropped='' n=0
     for entry in "${TEMPLATE[@]}"; do
         keys+="${entry%%|*},"
     done
-    CFG_CF_RECORD_NAME='' CFG_CF_PROXIED=''
     while IFS= read -r line || [[ -n "$line" ]]; do
         n=$((n + 1))
         line=${line%$'\r'}
@@ -72,23 +51,12 @@ read_config() {
         # 读不出值的行不能丢弃，否则会丢失配置值
         [[ "$line" =~ $PAIR ]] || die "$CONFIG_FILE 第 $n 行格式错误，配置文件未改动；请修正后重新执行 cf-ddns install"
         key=${BASH_REMATCH[1]}
-        if [[ "$keys" == *",$key,"* || "$key" == CF_RECORD_NAME || "$key" == CF_PROXIED ]]; then
+        if [[ "$keys" == *",$key,"* ]]; then
             printf -v "CFG_$key" '%s' "${BASH_REMATCH[2]}"
         else
             dropped+=" $key"
         fi
     done <"$CONFIG_FILE"
-    if [[ -n "$CFG_CF_RECORD_NAME" ]]; then
-        [[ -z "$CFG_CF_PROXIED" || "$CFG_CF_PROXIED" =~ ^(true|false)$ ]] || die "CF_PROXIED 只能是 true 或 false，配置文件未改动；请修正后重新执行 cf-ddns install"
-        name=$(tr '[:upper:]' '[:lower:]' <<<"$CFG_CF_RECORD_NAME")
-        if [[ ",$(tr '[:upper:]' '[:lower:]' <<<"$CFG_CF_RECORDS")," == *",$name:"* ]]; then
-            echo "CF_RECORDS 中已有 ${name}，旧版 CF_RECORD_NAME / CF_PROXIED 已移除"
-        else
-            proxied=$(legacy_proxied "$name") || die "无法读取 Cloudflare 上 $name 的代理状态，配置文件未改动；请检查网络、令牌及 curl / jq 是否已安装后重新执行 cf-ddns install"
-            CFG_CF_RECORDS="${CFG_CF_RECORDS:+$CFG_CF_RECORDS,}$name:$proxied"
-            echo "旧版 CF_RECORD_NAME / CF_PROXIED 已并入 CF_RECORDS：$name:$proxied"
-        fi
-    fi
     [[ -z "$dropped" ]] || echo "已移除新版无法识别的配置项：${dropped# }"
 }
 
@@ -310,7 +278,7 @@ EOF
 # 按白名单逐行读取 KEY=VALUE（允许行尾 # 注释），不 source 配置文件，避免执行其中的代码
 load_config() {
     local line key item items seen=, n=0
-    CF_API_TOKEN='' CF_ZONE_ID='' CF_RECORDS='' CF_RECORD_NAME='' CF_PROXIED='' ENABLE_IPV4='' ENABLE_IPV6='' CF_TTL='' RECORDS=()
+    CF_API_TOKEN='' CF_ZONE_ID='' CF_RECORDS='' ENABLE_IPV4='' ENABLE_IPV6='' CF_TTL='' RECORDS=()
     [[ -f "$CONFIG_FILE" && -r "$CONFIG_FILE" ]] || die "无法读取 ${CONFIG_FILE}：请以 root 运行，尚未安装时先执行 install"
     while IFS= read -r line || [[ -n "$line" ]]; do
         n=$((n + 1))
@@ -320,31 +288,22 @@ load_config() {
         [[ "$line" =~ $PAIR ]] || die "$CONFIG_FILE 第 $n 行格式错误"
         key=${BASH_REMATCH[1]}
         case "$key" in
-            CF_API_TOKEN | CF_ZONE_ID | CF_RECORDS | CF_RECORD_NAME | CF_PROXIED | ENABLE_IPV4 | ENABLE_IPV6 | CF_TTL) printf -v "$key" '%s' "${BASH_REMATCH[2]}" ;;
+            CF_API_TOKEN | CF_ZONE_ID | CF_RECORDS | ENABLE_IPV4 | ENABLE_IPV6 | CF_TTL) printf -v "$key" '%s' "${BASH_REMATCH[2]}" ;;
             INTERVAL_MINUTES) ;; # 只由 install 写入定时器，运行时不需要
             *) die "$CONFIG_FILE 第 $n 行：未知配置项 $key" ;;
         esac
     done <"$CONFIG_FILE"
     [[ "$CF_API_TOKEN" =~ $TOKEN_RE ]] || die "CF_API_TOKEN 未填写或格式不正确"
     [[ "$CF_ZONE_ID" =~ $ZONE_RE ]] || die "CF_ZONE_ID 未填写或格式不正确"
-    # RECORDS 条目格式：域名:是否开启代理:是否同步已有记录的代理状态（1 同步，0 只用于新建）
-    # Cloudflare 的域名不区分大小写，统一转小写后再查重
+    # RECORDS 条目格式：域名:是否开启代理；Cloudflare 的域名不区分大小写，统一转小写后再查重
     IFS=, read -ra items <<<"$(tr '[:upper:]' '[:lower:]' <<<"$CF_RECORDS")"
     for item in ${items[@]+"${items[@]}"}; do
         [[ "$item" =~ ^([^:]*):(true|false)$ && "${BASH_REMATCH[1]}" =~ $DOMAIN_RE ]] ||
             die "CF_RECORDS 中的「${item}」格式不正确，应为 域名:true 或 域名:false"
         [[ "$seen" != *",${item%:*},"* ]] || die "CF_RECORDS 中的 ${item%:*} 重复"
         seen+="${item%:*},"
-        RECORDS+=("$item:1")
+        RECORDS+=("$item")
     done
-    # 兼容旧版配置：CF_RECORD_NAME 的代理开关 CF_PROXIED 与旧版相同，只在新建记录时使用
-    if [[ -n "$CF_RECORD_NAME" ]]; then
-        CF_RECORD_NAME=$(tr '[:upper:]' '[:lower:]' <<<"$CF_RECORD_NAME")
-        [[ "$CF_RECORD_NAME" =~ $DOMAIN_RE ]] || die "CF_RECORD_NAME 格式不正确"
-        [[ "${CF_PROXIED:=false}" =~ ^(true|false)$ ]] || die "CF_PROXIED 只能是 true 或 false"
-        [[ "$seen" != *",$CF_RECORD_NAME,"* ]] || die "$CF_RECORD_NAME 同时出现在 CF_RECORDS 与 CF_RECORD_NAME 中"
-        RECORDS+=("$CF_RECORD_NAME:$CF_PROXIED:0")
-    fi
     ((${#RECORDS[@]})) || die "CF_RECORDS 未填写"
     [[ "$ENABLE_IPV4" =~ ^(true|false)$ && "$ENABLE_IPV6" =~ ^(true|false)$ ]] || die "ENABLE_IPV4、ENABLE_IPV6 只能是 true 或 false"
     [[ "$ENABLE_IPV4" == true || "$ENABLE_IPV6" == true ]] || die "ENABLE_IPV4 与 ENABLE_IPV6 不能同时为 false"
@@ -379,9 +338,9 @@ get_ip() {
     return 1
 }
 
-# 用法：sync_record A|AAAA IP 域名 true|false 1|0；最后一项为 0 时已有记录保留现有代理状态（旧版 CF_RECORD_NAME 行为）
+# 用法：sync_record A|AAAA IP 域名 true|false
 sync_record() {
-    local type=$1 ip=$2 name=$3 proxied=$4 sync_proxied=$5 resp count id current current_proxied body change=''
+    local type=$1 ip=$2 name=$3 proxied=$4 resp count id current current_proxied body change=''
     resp=$(cf_api GET "?type=$type&name.exact=$name") || return 1
     count=$(jq '.result | length' <<<"$resp")
     case "$count" in
@@ -397,7 +356,6 @@ sync_record() {
             current=$(jq -r '.result[0].content' <<<"$resp")
             current_proxied=$(jq -r '.result[0].proxied' <<<"$resp")
             [[ "$id" =~ ^[a-f0-9]{32}$ ]] || { log "${type}：$name 记录 ID 格式异常"; return 1; }
-            [[ "$sync_proxied" == 1 ]] || proxied=$current_proxied
             [[ "$current" == "$ip" ]] || change="IP $current -> $ip"
             [[ "$current_proxied" == "$proxied" ]] || change+="${change:+，}代理 $current_proxied -> $proxied"
             if [[ -z "$change" ]]; then
@@ -417,7 +375,7 @@ sync_record() {
 }
 
 main() {
-    local rc=0 family type version enabled ip item name proxied sync_proxied
+    local rc=0 family type version enabled ip item name proxied
     case "${1:-}" in
         install) install_self; return ;;
         "") ;;
@@ -440,8 +398,8 @@ main() {
             continue
         fi
         for item in "${RECORDS[@]}"; do
-            IFS=: read -r name proxied sync_proxied <<<"$item"
-            sync_record "$type" "$ip" "$name" "$proxied" "$sync_proxied" || { log "${type}：$name 同步失败"; rc=1; }
+            IFS=: read -r name proxied <<<"$item"
+            sync_record "$type" "$ip" "$name" "$proxied" || { log "${type}：$name 同步失败"; rc=1; }
         done
     done
     return "$rc"
