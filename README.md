@@ -59,7 +59,7 @@ cf-ddns install
 systemctl disable --now cf-ddns.timer
 systemctl stop systemd-journald@cf-ddns.service
 rm -f /usr/local/bin/cf-ddns /etc/cf-ddns.conf /etc/systemd/system/cf-ddns.service /etc/systemd/system/cf-ddns.timer /etc/systemd/journald@cf-ddns.conf
-rm -rf /etc/systemd/system/cf-ddns.timer.d "/var/log/journal/$(cat /etc/machine-id).cf-ddns"
+rm -rf "/var/log/journal/$(cat /etc/machine-id).cf-ddns"
 systemctl daemon-reload
 ```
 

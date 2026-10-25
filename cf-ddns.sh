@@ -57,10 +57,10 @@ read_config() {
             dropped+=" $key"
         fi
     done <"$CONFIG_FILE"
-    [[ -z "$dropped" ]] || echo "已移除新版无法识别的配置项：${dropped# }"
+    [[ -z "$dropped" ]] || echo "已移除无法识别的配置项：${dropped# }"
 }
 
-# 按新版模板写入配置文件；先写临时文件再替换，避免定时任务读到写了一半的配置，内容未变化时不改动文件
+# 按模板写入配置文件；先写临时文件再替换，避免定时任务读到写了一半的配置，内容未变化时不改动文件
 write_config() {
     local tmp
     tmp=$(mktemp "$CONFIG_FILE.XXXXXX")
@@ -217,7 +217,7 @@ install_self() {
     if [[ "$sd_version" =~ ^[0-9]+$ ]] && ((sd_version >= 245)); then
         namespace='LogNamespace=cf-ddns'
         log_cmd='journalctl --namespace=cf-ddns -n 20 --no-pager'
-        printf '[Journal]\nSystemMaxUse=10M\n' >"$JOURNAL_CONF"
+        printf '[Journal]\nSystemMaxUse=10M\nRuntimeMaxUse=10M\n' >"$JOURNAL_CONF"
     else
         echo "当前 systemd 版本低于 245，无法单独限制 DDNS 日志大小，日志写入系统日志"
     fi
@@ -251,11 +251,6 @@ AccuracySec=1s
 [Install]
 WantedBy=timers.target
 EOF
-    # 旧版说明曾用该覆盖文件设置间隔，现改由 INTERVAL_MINUTES 控制，留着会覆盖新设置
-    if [[ -e "$UNIT_DIR/cf-ddns.timer.d/interval.conf" ]]; then
-        rm -f "$UNIT_DIR/cf-ddns.timer.d/interval.conf"
-        echo "已删除旧的间隔覆盖文件 $UNIT_DIR/cf-ddns.timer.d/interval.conf，执行间隔改由 INTERVAL_MINUTES 控制"
-    fi
     systemctl daemon-reload
     # 日志实例已在运行时重启它，使新的大小限制生效
     [[ -z "$namespace" ]] || systemctl try-restart systemd-journald@cf-ddns.service
